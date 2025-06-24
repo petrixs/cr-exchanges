@@ -29,9 +29,10 @@ func (g *Gate) GetFundingRates() ([]FundingRate, error) {
 	defer resp.Body.Close()
 
 	var contracts []struct {
-		Name        string `json:"name"`
-		FundingRate string `json:"funding_rate"`
-		FundingTime int64  `json:"funding_next_apply"`
+		Name        string  `json:"name"`
+		FundingRate string  `json:"funding_rate"`
+		FundingTime int64   `json:"funding_next_apply"`
+		TradeSize   float64 `json:"trade_size"`
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&contracts); err != nil {
@@ -55,9 +56,11 @@ func (g *Gate) GetFundingRates() ([]FundingRate, error) {
 		nextFunding := time.Unix(contract.FundingTime, 0).In(location).Format(time.RFC3339)
 
 		result = append(result, FundingRate{
-			Symbol:      contract.Name,
-			Rate:        fundingRate,
-			NextFunding: nextFunding,
+			Symbol:        contract.Name,
+			Rate:          fundingRate,
+			NextFunding:   nextFunding,
+			Volume24h:     contract.TradeSize,
+			VolumeUSDT24h: 0,
 		})
 	}
 

@@ -10,7 +10,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"sort"
 	"strconv"
 	"time"
 )
@@ -60,71 +59,83 @@ func (o *OKX) signRequest(timestamp, method, requestPath string, body string) st
 func (o *OKX) GetFundingRates() ([]FundingRate, error) {
 	log.Println("Запрос ставок фандинга с OKX")
 
-	if o.ApiKey == "" || o.SecretKey == "" || o.Passphrase == "" {
-		// Если ключи API не настроены, возвращаем ошибку
-		log.Println("Ошибка: Ключи API для OKX не настроены")
-		return nil, fmt.Errorf("OKX API ключи не настроены")
+	// Получаем объемы
+	volumes, volumesUSDT, err := o.getVolumes()
+	if err != nil {
+		log.Printf("Ошибка получения объемов OKX: %v", err)
+		// Продолжаем работу без объемов
+		volumes = make(map[string]float64)
+		volumesUSDT = make(map[string]float64)
 	}
 
-	// Шаг 1: Сначала получим список инструментов
-	instruments, err := o.getInstruments()
+	// Получаем список всех инструментов
+	resp, err := http.Get("https://www.okx.com/api/v5/public/instruments?instType=SWAP")
 	if err != nil {
+		log.Printf("Ошибка запроса инструментов OKX: %v", err)
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var instrumentsResponse struct {
+		Code string `json:"code"`
+		Msg  string `json:"msg"`
+		Data []struct {
+			InstId string `json:"instId"`
+		} `json:"data"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&instrumentsResponse); err != nil {
+		log.Printf("Ошибка декодирования инструментов OKX: %v", err)
 		return nil, err
 	}
 
-	log.Printf("Получено %d инструментов от OKX", len(instruments))
+	if instrumentsResponse.Code != "0" {
+		return nil, fmt.Errorf("OKX API ошибка: %s - %s", instrumentsResponse.Code, instrumentsResponse.Msg)
+	}
 
-	// Шаг 2: Получаем ставки фандинга для каждого инструмента
-	result := make([]FundingRate, 0, len(instruments))
+	log.Printf("Получено %d инструментов OKX", len(instrumentsResponse.Data))
 
-	// Подробное логирование ставок
-	var allRates []string
-	var highRates []string
+	var result []FundingRate
+	var nonZeroRates []string
 
-	// Для соблюдения ограничения API: 20 запросов в 2 секунды (10 запросов в секунду)
-	rateLimiter := time.NewTicker(100 * time.Millisecond) // 100 мс между запросами = 10 запросов в секунду
-	defer rateLimiter.Stop()
+	// Обрабатываем только первые 50 инструментов для быстрого тестирования
+	maxInstruments := 50
+	if len(instrumentsResponse.Data) > maxInstruments {
+		instrumentsResponse.Data = instrumentsResponse.Data[:maxInstruments]
+	}
 
-	log.Printf("Начинаем получение ставок фандинга для %d инструментов...", len(instruments))
+	processed := 0
+	for _, instrument := range instrumentsResponse.Data {
+		instId := instrument.InstId
 
-	for i, instId := range instruments {
-		// Ожидаем тикера для соблюдения ограничения API
-		<-rateLimiter.C
+		// Получаем объемы для данного инструмента
+		volume24h := volumes[instId]
+		volumeUSDT24h := volumesUSDT[instId]
 
-		rate, err := o.getFundingRate(instId)
+		fundingRate, err := o.getFundingRateForInstrument(instId, volume24h, volumeUSDT24h)
 		if err != nil {
-			log.Printf("Ошибка получения ставки для %s: %v", instId, err)
+			log.Printf("Ошибка получения фандинг ставки для %s: %v", instId, err)
 			continue
 		}
 
-		if rate.Rate != 0 {
-			result = append(result, rate)
-
-			// Сохраняем для логирования
-			rateStr := fmt.Sprintf("%s: %.6f", rate.Symbol, rate.Rate)
-			allRates = append(allRates, rateStr)
-
-			// Высокая ставка (по абсолютному значению больше 0.00001 или 0.001%)
-			if rate.Rate > 0.00001 || rate.Rate < -0.00001 {
-				highRates = append(highRates, rateStr)
-			}
+		if fundingRate.Rate != 0 {
+			nonZeroRates = append(nonZeroRates, fmt.Sprintf("%s: %f", instId, fundingRate.Rate))
 		}
 
+		result = append(result, fundingRate)
+		processed++
+
+		// Уменьшаем задержку
+		time.Sleep(50 * time.Millisecond)
+
 		// Логируем прогресс каждые 10 инструментов
-		if (i+1)%10 == 0 {
-			log.Printf("Обработано %d/%d инструментов OKX", i+1, len(instruments))
+		if processed%10 == 0 {
+			log.Printf("Обработано %d/%d инструментов OKX", processed, len(instrumentsResponse.Data))
 		}
 	}
 
-	// Сортируем и выводим ставки для отладки
-	sort.Strings(highRates)
-	sort.Strings(allRates)
-
-	// log.Printf("OKX все ставки фандинга (%d): %v", len(allRates), allRates)
-
-	log.Printf("OKX ненулевые ставки фандинга (%d): %v", len(highRates), highRates)
+	log.Printf("OKX ненулевые ставки фандинга (%d): %v", len(nonZeroRates), nonZeroRates)
 	log.Printf("Получено %d ставок фандинга с OKX", len(result))
-
 	return result, nil
 }
 
@@ -199,83 +210,100 @@ func (o *OKX) getInstruments() ([]string, error) {
 }
 
 // getFundingRate получает ставку фандинга для конкретного инструмента
-func (o *OKX) getFundingRate(instId string) (FundingRate, error) {
-	endpoint := "/api/v5/public/funding-rate"
-	queryParams := fmt.Sprintf("?instId=%s", instId)
-	timestamp := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
-	signature := o.signRequest(timestamp, "GET", endpoint+queryParams, "")
+func (o *OKX) getFundingRateForInstrument(instId string, volume24h, volumeUSDT24h float64) (FundingRate, error) {
+	// Получаем информацию о фандинг ставке для конкретного инструмента
+	url := fmt.Sprintf("https://www.okx.com/api/v5/public/funding-rate?instId=%s", instId)
 
-	client := &http.Client{}
-	req, err := http.NewRequest("GET", "https://www.okx.com"+endpoint+queryParams, nil)
+	resp, err := http.Get(url)
 	if err != nil {
-		return FundingRate{}, fmt.Errorf("ошибка создания запроса ставки фандинга: %v", err)
-	}
-
-	// Добавляем заголовки для аутентификации
-	req.Header.Add("OK-ACCESS-KEY", o.ApiKey)
-	req.Header.Add("OK-ACCESS-SIGN", signature)
-	req.Header.Add("OK-ACCESS-TIMESTAMP", timestamp)
-	req.Header.Add("OK-ACCESS-PASSPHRASE", o.Passphrase)
-	req.Header.Add("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return FundingRate{}, fmt.Errorf("ошибка запроса ставки фандинга: %v", err)
+		return FundingRate{}, err
 	}
 	defer resp.Body.Close()
 
-	// Чтение ответа
-	respBody, _ := ioutil.ReadAll(resp.Body)
-
-	// Проверяем корректность ответа
-	if resp.StatusCode != 200 {
-		return FundingRate{}, fmt.Errorf("код ошибки %d для %s: %s", resp.StatusCode, instId, string(respBody))
-	}
-
-	type FundingRateData struct {
-		InstID      string `json:"instId"`
-		FundingRate string `json:"fundingRate"`
-		FundingTime string `json:"fundingTime"`
-	}
-
 	var response struct {
-		Code string            `json:"code"`
-		Data []FundingRateData `json:"data"`
+		Code string `json:"code"`
+		Msg  string `json:"msg"`
+		Data []struct {
+			InstId          string `json:"instId"`
+			FundingRate     string `json:"fundingRate"`
+			NextFundingTime string `json:"nextFundingTime"`
+		} `json:"data"`
 	}
 
-	if err := json.Unmarshal(respBody, &response); err != nil {
-		return FundingRate{}, fmt.Errorf("ошибка декодирования ставки фандинга: %v", err)
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return FundingRate{}, err
 	}
 
-	// Если данных нет или пустой массив
+	if response.Code != "0" {
+		return FundingRate{}, fmt.Errorf("OKX API ошибка для %s: %s - %s", instId, response.Code, response.Msg)
+	}
+
 	if len(response.Data) == 0 {
-		return FundingRate{}, fmt.Errorf("нет данных по ставке фандинга")
+		return FundingRate{}, fmt.Errorf("нет данных о фандинг ставке для %s", instId)
 	}
 
-	// Получаем данные из ответа
-	data := response.Data[0] // Берем первый элемент массива
-	fundingRate := 0.0
+	data := response.Data[0]
 
-	// Конвертируем строку в число
-	if data.FundingRate != "" {
-		if _, err := fmt.Sscanf(data.FundingRate, "%f", &fundingRate); err != nil {
-			log.Printf("Ошибка конвертации ставки %s: %v", data.FundingRate, err)
-		}
+	// Парсим ставку фандинга
+	fundingRate, err := strconv.ParseFloat(data.FundingRate, 64)
+	if err != nil {
+		return FundingRate{}, fmt.Errorf("ошибка парсинга ставки фандинга %s: %v", data.FundingRate, err)
 	}
 
-	// Определяем время следующей выплаты
-	location := GetLocationFromEnv()
-	nextFundingTime := ""
-	if data.FundingTime != "" {
-		if fundingTimestamp, err := strconv.ParseInt(data.FundingTime, 10, 64); err == nil {
-			t := time.Unix(fundingTimestamp/1000, 0)
-			nextFundingTime = t.In(location).Format(time.RFC3339)
-		}
+	// Парсим время следующего фандинга
+	nextFundingTimeMs, err := strconv.ParseInt(data.NextFundingTime, 10, 64)
+	if err != nil {
+		return FundingRate{}, fmt.Errorf("ошибка парсинга времени фандинга %s: %v", data.NextFundingTime, err)
 	}
+
+	nextFundingTime := time.Unix(nextFundingTimeMs/1000, 0).Format(time.RFC3339)
 
 	return FundingRate{
-		Symbol:      instId,
-		Rate:        fundingRate,
-		NextFunding: nextFundingTime,
+		Symbol:        instId,
+		Rate:          fundingRate,
+		NextFunding:   nextFundingTime,
+		Volume24h:     volume24h,
+		VolumeUSDT24h: volumeUSDT24h,
 	}, nil
+}
+
+// Структура для 24h статистики OKX
+type okxTickerResponse struct {
+	Code string `json:"code"`
+	Data []struct {
+		InstId    string `json:"instId"`
+		Vol24h    string `json:"vol24h"`
+		VolCcy24h string `json:"volCcy24h"`
+	} `json:"data"`
+}
+
+// Получаем объемы для всех пар
+func (o *OKX) getVolumes() (map[string]float64, map[string]float64, error) {
+	resp, err := http.Get("https://www.okx.com/api/v5/market/tickers?instType=SWAP")
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+
+	var tickerData okxTickerResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tickerData); err != nil {
+		return nil, nil, err
+	}
+
+	if tickerData.Code != "0" {
+		return nil, nil, fmt.Errorf("OKX API error: %s", tickerData.Code)
+	}
+
+	volumes := make(map[string]float64)
+	volumesUSDT := make(map[string]float64)
+
+	for _, item := range tickerData.Data {
+		vol24h, _ := strconv.ParseFloat(item.Vol24h, 64)
+		volCcy24h, _ := strconv.ParseFloat(item.VolCcy24h, 64)
+
+		volumes[item.InstId] = vol24h
+		volumesUSDT[item.InstId] = volCcy24h
+	}
+
+	return volumes, volumesUSDT, nil
 }

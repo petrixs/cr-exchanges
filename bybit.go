@@ -35,6 +35,8 @@ func (b *Bybit) GetFundingRates() ([]FundingRate, error) {
 				Symbol        string `json:"symbol"`
 				FundingRate   string `json:"fundingRate"`
 				NextFundingAt string `json:"nextFundingTime"`
+				Volume24h     string `json:"volume24h"`
+				Turnover24h   string `json:"turnover24h"`
 			} `json:"list"`
 		} `json:"result"`
 	}
@@ -63,12 +65,26 @@ func (b *Bybit) GetFundingRates() ([]FundingRate, error) {
 		}
 
 		result = append(result, FundingRate{
-			Symbol:      rate.Symbol,
-			Rate:        fundingRate,
-			NextFunding: nextFundingTime,
+			Symbol:        rate.Symbol,
+			Rate:          fundingRate,
+			NextFunding:   nextFundingTime,
+			Volume24h:     parseFloatFromString(rate.Volume24h),
+			VolumeUSDT24h: parseFloatFromString(rate.Turnover24h),
 		})
 	}
 
 	log.Printf("Получено %d ставок фандинга с Bybit", len(result))
 	return result, nil
+}
+
+// parseFloatFromString безопасно преобразует строку в float64
+func parseFloatFromString(s string) float64 {
+	if s == "" {
+		return 0
+	}
+	val, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0
+	}
+	return val
 }

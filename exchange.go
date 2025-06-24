@@ -13,9 +13,11 @@ type Exchange interface {
 }
 
 type FundingRate struct {
-	Symbol      string
-	Rate        float64
-	NextFunding string
+	Symbol        string
+	Rate          float64
+	NextFunding   string
+	Volume24h     float64 // Объем за 24 часа в базовой валюте
+	VolumeUSDT24h float64 // Объем за 24 часа в USDT
 }
 
 // RatesCache хранит кэшированные ставки фандинга
